@@ -6,7 +6,7 @@ import copy
 import operator
 import warnings
 from contextlib import aclosing, nullcontext
-from functools import partial, reduce
+from functools import cache, partial, reduce
 from itertools import chain, islice
 from weakref import ref as weak_ref
 
@@ -2964,6 +2964,7 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
         rel_qs._prefetch_related_lookups = ()
 
     all_related_objects = list(rel_qs)
+    default_queryset_class = None
 
     rel_obj_cache = {}
     for rel_obj in all_related_objects:
@@ -3010,17 +3011,112 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
             if as_attr:
                 setattr(obj, to_attr, vals)
             else:
-                manager = getattr(obj, to_attr)
                 if leaf and lookup.queryset is not None:
-                    qs = manager._apply_rel_filters(lookup.queryset._chain())
+                    base_queryset = lookup.queryset
+                    queryset_class = type(base_queryset)
+                    using = base_queryset._db
                 else:
-                    qs = manager.get_queryset()
+                    base_queryset = None
+                    if default_queryset_class is None:
+                        default_queryset_class = type(
+                            _related_manager_base_queryset(getattr(obj, to_attr))
+                        )
+                    queryset_class = default_queryset_class
+                    using = None
+                # Building the related manager and its filtered QuerySet for
+                # every instance is most of the Python cost of prefetching, and
+                # reading the prefetched objects never needs either. Defer them
+                # until the QuerySet is used for anything else.
+                qs = _lazy_related_queryset_class(queryset_class)(
+                    model=rel_qs.model,
+                    query=_LAZY_RELATED_QUERY,
+                    using=using,
+                    hints={"instance": obj},
+                )
+                qs.__dict__["_lazy_relation"] = (obj, to_attr, base_queryset)
                 qs._result_cache = vals
                 # We don't want the individual qs doing prefetch_related now,
                 # since we have merged this into the current work.
                 qs._prefetch_done = True
                 obj._prefetched_objects_cache[cache_name] = qs
     return all_related_objects, additional_lookups
+
+
+def _related_manager_base_queryset(manager):
+    """
+    The related manager's QuerySet before it's filtered to its instance,
+    bypassing the instance's prefetch cache.
+    """
+    return super(type(manager), manager).get_queryset()
+
+
+_LAZY_RELATED_QUERY = object()
+
+
+class LazyRelatedQuerySetMixin:
+    """
+    The QuerySet a related manager returns for prefetched objects, holding the
+    prefetched results with the related manager's query built on first use.
+
+    Iterating, len(), bool(), indexing, count(), and exists() read the result
+    cache and never build the query. Anything else builds it exactly as the
+    related manager would, after which this is an ordinary QuerySet of the
+    related manager's QuerySet class.
+    """
+
+    @property
+    def _query(self):
+        self._build_related_queryset()
+        return self._query
+
+    @_query.setter
+    def _query(self, value):
+        if value is _LAZY_RELATED_QUERY:
+            return
+        self.__dict__.pop("_lazy_relation", None)
+        self.__class__ = self.__class__.__bases__[1]
+        self._query = value
+
+    def _build_related_queryset(self):
+        instance, attr, base_queryset = self.__dict__.pop("_lazy_relation")
+        manager = getattr(instance, attr)
+        if base_queryset is None:
+            base_queryset = _related_manager_base_queryset(manager)
+        else:
+            base_queryset = base_queryset._chain()
+        queryset = manager._apply_rel_filters(base_queryset)
+        result_cache = self._result_cache
+        self.__class__ = type(queryset)
+        self.__dict__.update(queryset.__dict__)
+        self._result_cache = result_cache
+        self._prefetch_done = True
+        # The query property may have checked for a deferred filter before
+        # reading _query triggered this, so apply the relation's filter now.
+        self.query
+
+    def _clone(self):
+        self._build_related_queryset()
+        return self._clone()
+
+    def __deepcopy__(self, memo):
+        self._build_related_queryset()
+        return self.__deepcopy__(memo)
+
+    def __reduce_ex__(self, protocol):
+        self._build_related_queryset()
+        return self.__reduce_ex__(protocol)
+
+
+@cache
+def _lazy_related_queryset_class(queryset_class):
+    return type(
+        queryset_class.__name__,
+        (LazyRelatedQuerySetMixin, queryset_class),
+        {
+            "__module__": queryset_class.__module__,
+            "__qualname__": queryset_class.__qualname__,
+        },
+    )
 
 
 class RelatedPopulator:

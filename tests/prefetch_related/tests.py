@@ -1,3 +1,5 @@
+import copy
+import pickle
 from unittest import mock
 
 from django.contrib.contenttypes.models import ContentType
@@ -48,6 +50,7 @@ from .models import (
     SelfDirectedEmployee,
     TaggedItem,
     Teacher,
+    TeacherQuerySet,
     WordEntry,
 )
 
@@ -2338,4 +2341,85 @@ class PrefetchRelatedMTICacheTests(TestCase):
         self.assertSequenceEqual(gp.authorwithage.favorite_authors.all(), [])
         self.assertSequenceEqual(
             gp.authorwithage.authorwithagechild.favorite_authors.all(), []
+        )
+
+
+class LazyRelatedQuerySetTests(TestDataMixin, TestCase):
+    """
+    Prefetched objects are held in the QuerySet the related manager would
+    return, with its query built only when something needs it.
+    """
+
+    def get_book(self, *lookups):
+        return Book.objects.prefetch_related(*lookups).get(pk=self.book1.pk)
+
+    def test_reading_prefetched_objects_does_not_build_the_query(self):
+        authors = self.get_book("authors").authors.all()
+        with self.assertNumQueries(0):
+            self.assertEqual(
+                sorted(author.name for author in authors),
+                ["Anne", "Charlotte", "Emily"],
+            )
+            self.assertEqual(len(authors), 3)
+            self.assertIs(bool(authors), True)
+            self.assertEqual(authors.count(), 3)
+            self.assertIs(authors.exists(), True)
+            self.assertEqual(authors[0], list(authors)[0])
+        self.assertIsInstance(authors, QuerySet)
+        self.assertIn("_lazy_relation", authors.__dict__)
+
+    def test_chaining_builds_the_related_managers_queryset(self):
+        book = self.get_book("authors")
+        unprefetched = Book.objects.get(pk=self.book1.pk).authors.all()
+        with self.assertNumQueries(1):
+            self.assertSequenceEqual(book.authors.filter(name="Anne"), [self.author2])
+        authors = book.authors.all()
+        self.assertIs(type(authors), QuerySet)
+        self.assertEqual(str(authors.query), str(unprefetched.query))
+        with self.assertNumQueries(0):
+            self.assertEqual(len(authors), 3)
+
+    def test_reverse_foreign_key(self):
+        book = self.get_book("first_time_authors")
+        unprefetched = Book.objects.get(pk=self.book1.pk).first_time_authors.all()
+        with self.assertNumQueries(0):
+            self.assertEqual(book.first_time_authors.count(), 3)
+        self.assertEqual(
+            str(book.first_time_authors.all().query), str(unprefetched.query)
+        )
+
+    def test_custom_prefetch_queryset_class(self):
+        department = Department.objects.create(name="English")
+        department.teachers.add(Teacher.objects.create(name="Mr Cleese"))
+        department = Department.objects.prefetch_related(
+            Prefetch("teachers", queryset=Teacher.objects_custom.all())
+        ).get(pk=department.pk)
+        teachers = department.teachers.all()
+        self.assertIsInstance(teachers, TeacherQuerySet)
+        self.assertSequenceEqual(
+            teachers.filter(name="Mr Cleese").values_list("name", flat=True),
+            ["Mr Cleese"],
+        )
+        self.assertIs(type(teachers), TeacherQuerySet)
+
+    def test_writes_clear_the_prefetched_objects(self):
+        book = self.get_book("authors")
+        book.authors.remove(self.author1)
+        self.assertEqual(
+            sorted(author.name for author in book.authors.all()), ["Anne", "Emily"]
+        )
+
+    def test_pickle(self):
+        book = self.get_book("authors")
+        restored = pickle.loads(pickle.dumps(book))
+        with self.assertNumQueries(0):
+            authors = restored.authors.all()
+            self.assertEqual(len(authors), 3)
+        self.assertIs(type(authors), QuerySet)
+
+    def test_deepcopy(self):
+        book = copy.deepcopy(self.get_book("authors"))
+        self.assertEqual(
+            sorted(author.name for author in book.authors.all()),
+            ["Anne", "Charlotte", "Emily"],
         )
