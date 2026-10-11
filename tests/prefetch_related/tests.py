@@ -2409,6 +2409,26 @@ class LazyRelatedQuerySetTests(TestDataMixin, TestCase):
             sorted(author.name for author in book.authors.all()), ["Anne", "Emily"]
         )
 
+    def test_copy_after_prefetch_keeps_original_binding(self):
+        """
+        Like an unprefetched many-to-many manager, the prefetched QuerySet
+        stays bound to the instance values from when it was fetched (#33984).
+        """
+        book = self.get_book("authors")
+        old_authors = book.authors.all()
+        book.pk = None
+        book._state.adding = True
+        book.save()
+        self.assertCountEqual(
+            old_authors.filter(name__in=["Anne", "Charlotte"]),
+            [self.author1, self.author2],
+        )
+        book.authors.set(old_authors)
+        self.assertCountEqual(
+            Book.objects.get(pk=book.pk).authors.all(),
+            [self.author1, self.author2, self.author3],
+        )
+
     def test_pickle(self):
         book = self.get_book("authors")
         restored = pickle.loads(pickle.dumps(book))

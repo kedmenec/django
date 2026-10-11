@@ -2964,7 +2964,7 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
         rel_qs._prefetch_related_lookups = ()
 
     all_related_objects = list(rel_qs)
-    default_queryset_class = None
+    related_manager_details = None
 
     rel_obj_cache = {}
     for rel_obj in all_related_objects:
@@ -3011,16 +3011,19 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
             if as_attr:
                 setattr(obj, to_attr, vals)
             else:
+                if related_manager_details is None:
+                    # The related managers for every instance are alike, so
+                    # inspect one for the rest.
+                    related_manager_details = _related_manager_details(
+                        getattr(obj, to_attr)
+                    )
+                default_queryset_class, bound_attnames = related_manager_details
                 if leaf and lookup.queryset is not None:
                     base_queryset = lookup.queryset
                     queryset_class = type(base_queryset)
                     using = base_queryset._db
                 else:
                     base_queryset = None
-                    if default_queryset_class is None:
-                        default_queryset_class = type(
-                            _related_manager_base_queryset(getattr(obj, to_attr))
-                        )
                     queryset_class = default_queryset_class
                     using = None
                 # Building the related manager and its filtered QuerySet for
@@ -3033,13 +3036,38 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
                     using=using,
                     hints={"instance": obj},
                 )
-                qs.__dict__["_lazy_relation"] = (obj, to_attr, base_queryset)
+                qs.__dict__["_lazy_relation"] = (
+                    obj,
+                    to_attr,
+                    base_queryset,
+                    bound_attnames,
+                    tuple(getattr(obj, attname) for attname in bound_attnames),
+                )
                 qs._result_cache = vals
                 # We don't want the individual qs doing prefetch_related now,
                 # since we have merged this into the current work.
                 qs._prefetch_done = True
                 obj._prefetched_objects_cache[cache_name] = qs
     return all_related_objects, additional_lookups
+
+
+def _related_manager_details(manager):
+    """
+    Return the related manager's unfiltered QuerySet class, and the attnames
+    of the instance values it captures when it's created. Many-to-many and
+    generic relation managers bind to those values at creation, so a QuerySet
+    built later must use the values from when the objects were prefetched.
+    """
+    queryset_class = type(_related_manager_base_queryset(manager))
+    if source_field := getattr(manager, "source_field", None):
+        bound_attnames = tuple(
+            rh_field.attname for _, rh_field in source_field.related_fields
+        )
+    elif hasattr(manager, "pk_val"):
+        bound_attnames = (manager.instance._meta.pk.attname,)
+    else:
+        bound_attnames = ()
+    return queryset_class, bound_attnames
 
 
 def _related_manager_base_queryset(manager):
@@ -3078,7 +3106,16 @@ class LazyRelatedQuerySetMixin:
         self._query = value
 
     def _build_related_queryset(self):
-        instance, attr, base_queryset = self.__dict__.pop("_lazy_relation")
+        instance, attr, base_queryset, bound_attnames, bound_values = self.__dict__.pop(
+            "_lazy_relation"
+        )
+        current_values = tuple(getattr(instance, name) for name in bound_attnames)
+        if current_values != bound_values:
+            # Bind as the related manager would have when the objects were
+            # prefetched, e.g. before the instance was saved with a new pk.
+            instance = copy.copy(instance)
+            for name, value in zip(bound_attnames, bound_values):
+                setattr(instance, name, value)
         manager = getattr(instance, attr)
         if base_queryset is None:
             base_queryset = _related_manager_base_queryset(manager)
