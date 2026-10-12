@@ -3046,11 +3046,19 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
 
 
 def _lazy_prefetch_queryset(obj, to_attr, cache_name, vals):
+    # Managers bind to the instance's values when created. Remember the pk so
+    # the holder stays bound to the instance as it was prefetched (#33984).
+    pk = obj.pk
+
     def build():
-        cache = obj._prefetched_objects_cache
+        target = obj
+        if obj.pk != pk:
+            target = copy.copy(obj)
+            target.pk = pk
+        cache = target._prefetched_objects_cache
         holder = cache.pop(cache_name)
         try:
-            return getattr(obj, to_attr).get_queryset()
+            return getattr(target, to_attr).get_queryset()
         finally:
             cache[cache_name] = holder
 
