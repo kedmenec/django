@@ -392,6 +392,26 @@ class QuerySet(AltersData):
         self._deferred_filter = None
         self._cloning_enabled = True
 
+    def __getattr__(self, name):
+        # Prototype: a prefetch holder is created without any instance state
+        # and builds itself on first access to anything but the result cache.
+        if name.startswith("__") or "_lazy_build" not in self.__dict__:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}"
+            )
+        self._build_lazy()
+        return object.__getattribute__(self, name)
+
+    def _build_lazy(self):
+        state = self.__dict__
+        build = state.pop("_lazy_build", None)
+        if build is None:
+            return
+        built = build()
+        for key, value in built.__dict__.items():
+            if key not in ("_result_cache", "_prefetch_done"):
+                state[key] = value
+
     @property
     def query(self):
         if self._deferred_filter:
@@ -423,6 +443,7 @@ class QuerySet(AltersData):
 
     def __deepcopy__(self, memo):
         """Don't populate the QuerySet's cache."""
+        self._build_lazy()
         obj = self.__class__()
         for k, v in self.__dict__.items():
             if k == "_result_cache":
@@ -434,6 +455,7 @@ class QuerySet(AltersData):
     def __getstate__(self):
         # Force the cache to be fully populated.
         self._fetch_all()
+        self._build_lazy()
         return {**self.__dict__, DJANGO_VERSION_PICKLE_KEY: django.__version__}
 
     def __setstate__(self, state):
@@ -3010,17 +3032,35 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
             if as_attr:
                 setattr(obj, to_attr, vals)
             else:
-                manager = getattr(obj, to_attr)
                 if leaf and lookup.queryset is not None:
+                    manager = getattr(obj, to_attr)
                     qs = manager._apply_rel_filters(lookup.queryset._chain())
+                    qs._result_cache = vals
+                    # We don't want the individual qs doing prefetch_related
+                    # now, since we have merged this into the current work.
+                    qs._prefetch_done = True
                 else:
-                    qs = manager.get_queryset()
-                qs._result_cache = vals
-                # We don't want the individual qs doing prefetch_related now,
-                # since we have merged this into the current work.
-                qs._prefetch_done = True
+                    qs = _lazy_prefetch_queryset(obj, to_attr, cache_name, vals)
                 obj._prefetched_objects_cache[cache_name] = qs
     return all_related_objects, additional_lookups
+
+
+def _lazy_prefetch_queryset(obj, to_attr, cache_name, vals):
+    def build():
+        cache = obj._prefetched_objects_cache
+        holder = cache.pop(cache_name)
+        try:
+            return getattr(obj, to_attr).get_queryset()
+        finally:
+            cache[cache_name] = holder
+
+    qs = QuerySet.__new__(QuerySet)
+    state = qs.__dict__
+    state["_result_cache"] = vals
+    state["_prefetch_done"] = True
+    state["_prefetch_related_lookups"] = ()
+    state["_lazy_build"] = build
+    return qs
 
 
 class RelatedPopulator:
